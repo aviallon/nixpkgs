@@ -49,5 +49,5 @@ index 1f1075b..7476c8e 100755
 +printf "Done! Model '%s' saved in 'ggml-%s.bin'\n" "$model" "$model"
  printf "You can now use it like this:\n\n"
 -printf "  $ ./main -m %s/ggml-%s.bin -f samples/jfk.wav\n" "$models_path" "$model"
-+printf "  $ whisper-cpp -m ggml-%s.bin -f samples/jfk.wav\n" "$model"
++printf "  $ whisper-cli -m ggml-%s.bin -f samples/jfk.wav\n" "$model"
  printf "\n"

@@ -4,8 +4,9 @@
   cmake,
   apple-sdk_11,
   ninja,
-  fetchFromGitHub,
   SDL2,
+  ffmpeg_6,
+  fetchFromGitHub,
   wget,
   which,
   autoAddDriverRunpath,
@@ -28,6 +29,7 @@
   vulkan-loader,
 
   withSDL ? true,
+  withFFmpeg ? true,
 }:
 
 assert metalSupport -> stdenv.hostPlatform.isDarwin;
@@ -45,17 +47,27 @@ let
     optionals
     optionalString
     forEach
+    getLib
+    getDev
     ;
 
   darwinBuildInputs = [ apple-sdk_11 ];
 
+  cudaNativeBuildInputs = with cudaPackages; [
+    cuda_nvcc
+    autoAddDriverRunpath
+    (getDev cuda_cccl)
+    (getDev cuda_cudart)
+    (getDev libcublas)
+  ];
+
   cudaBuildInputs = with cudaPackages; [
-    cuda_cccl # <nv/target>
+    (getLib cuda_cccl) # <nv/target>
 
     # A temporary hack for reducing the closure size, remove once cudaPackages
     # have stopped using lndir: https://github.com/NixOS/nixpkgs/issues/271792
-    cuda_cudart
-    libcublas
+    (getLib cuda_cudart)
+    (getLib libcublas)
   ];
 
   rocmBuildInputs = with rocmPackages; [
@@ -64,22 +76,28 @@ let
     rocblas
   ];
 
-  vulkanBuildInputs = [
-    shaderc
+  vulkanNativeBuildInputs = [
+    (getDev shaderc)
     vulkan-headers
-    vulkan-loader
+    (getDev vulkan-loader)
+  ];
+
+  vulkanBuildInputs = [
+    (getLib shaderc)
+    vulkan-headers
+    (getLib vulkan-loader)
   ];
 
 in
 effectiveStdenv.mkDerivation (finalAttrs: {
   pname = "whisper-cpp";
-  version = "1.7.2";
+  version = "1.7.4";
 
   src = fetchFromGitHub {
     owner = "ggerganov";
     repo = "whisper.cpp";
     rev = "refs/tags/v${finalAttrs.version}";
-    hash = "sha256-y30ZccpF3SCdRGa+P3ddF1tT1KnvlI4Fexx81wZxfTk=";
+    hash = "sha256-6mPnX9gE+labntNRukxpZeUebecBJlmzk1PZ/lvFam4=";
   };
 
   # The upstream download script tries to download the models to the
@@ -88,13 +106,13 @@ effectiveStdenv.mkDerivation (finalAttrs: {
   # the models to the current directory of where it is being run from.
   patches = [ ./download-models.patch ];
 
-  postPatch = ''
+  /*postPatch = ''
     for target in examples/{bench,command,main,quantize,server,stream,talk}/CMakeLists.txt; do
       if ! grep -q -F 'install('; then
         echo 'install(TARGETS ''${TARGET} RUNTIME)' >> $target
       fi
     done
-  '';
+  '';*/
 
   nativeBuildInputs =
     [
@@ -103,26 +121,30 @@ effectiveStdenv.mkDerivation (finalAttrs: {
       which
       makeWrapper
     ]
-    ++ lib.optionals cudaSupport [
-      cudaPackages.cuda_nvcc
-      autoAddDriverRunpath
-    ];
+    ++ optionals cudaSupport cudaNativeBuildInputs
+    ++ optionals vulkanSupport vulkanNativeBuildInputs
+    ++ optional withSDL (getDev SDL2)
+    ++ optional withFFmpeg (getDev ffmpeg_6);
 
   buildInputs =
-    optional withSDL SDL2
+    optional withSDL (getLib SDL2)
+    ++ optional withFFmpeg (getLib ffmpeg_6)
     ++ optionals effectiveStdenv.hostPlatform.isDarwin darwinBuildInputs
     ++ optionals cudaSupport cudaBuildInputs
     ++ optionals rocmSupport rocmBuildInputs
     ++ optionals vulkanSupport vulkanBuildInputs;
 
+  buildTargets = [ "examples/whisper-cli" ];
+
   cmakeFlags =
     [
-      (cmakeBool "WHISPER_BUILD_EXAMPLES" true)
+      (cmakeBool "WHISPER_BUILD_EXAMPLES" false)
       (cmakeBool "GGML_CUDA" cudaSupport)
       (cmakeBool "GGML_HIPBLAS" rocmSupport)
       (cmakeBool "GGML_VULKAN" vulkanSupport)
       (cmakeBool "WHISPER_SDL2" withSDL)
-      (cmakeBool "GGML_LTO" true)
+      (cmakeBool "WHISPER_FFMPEG" withFFmpeg)
+      (cmakeBool "GGML_LTO" false)
       (cmakeBool "GGML_NATIVE" false)
       (cmakeBool "BUILD_SHARED_LIBS" (!effectiveStdenv.hostPlatform.isStatic))
     ]
@@ -154,13 +176,13 @@ effectiveStdenv.mkDerivation (finalAttrs: {
 
   postInstall = ''
     # Add "whisper-cpp" prefix before every command
-    mv -v $out/bin/{main,whisper-cpp}
+    #mv -v $out/bin/{main,whisper-cpp}
 
-    for file in $out/bin/*; do
-      if [[ -x "$file" && -f "$file" && "$(basename $file)" != "whisper-cpp" ]]; then
-        mv -v "$file" "$out/bin/whisper-cpp-$(basename $file)"
-      fi
-    done
+    #for file in $out/bin/*; do
+    #  if [[ -x "$file" && -f "$file" && "$(basename $file)" != "whisper-cpp" ]]; then
+    #    mv -v "$file" "$out/bin/whisper-cpp-$(basename $file)"
+    #  fi
+    #done
 
     install -v -D -m755 $src/models/download-ggml-model.sh $out/bin/whisper-cpp-download-ggml-model
 
@@ -168,13 +190,13 @@ effectiveStdenv.mkDerivation (finalAttrs: {
       --prefix PATH : ${lib.makeBinPath [ wget ]}
   '';
 
-  requiredSystemFeatures = optionals rocmSupport [ "big-parallel" ]; # rocmSupport multiplies build time by the number of GPU targets, which takes arround 30 minutes on a 16-cores system to build
+  requiredSystemFeatures = optionals (rocmSupport || cudaSupport) [ "big-parallel" ]; # (rocm|cuda)Support multiplies build time by the number of GPU targets, which takes arround 30 minutes on a 16-cores system to build
 
   doInstallCheck = true;
 
   installCheckPhase = ''
     runHook preInstallCheck
-    $out/bin/whisper-cpp --help >/dev/null
+    $out/bin/whisper-cli --help >/dev/null
     runHook postInstallCheck
   '';
 
@@ -186,7 +208,7 @@ effectiveStdenv.mkDerivation (finalAttrs: {
     '';
     homepage = "https://github.com/ggerganov/whisper.cpp";
     license = lib.licenses.mit;
-    mainProgram = "whisper-cpp";
+    mainProgram = "whisper-cli";
     platforms = lib.platforms.all;
     broken = coreMLSupport;
     badPlatforms = optionals cudaSupport lib.platforms.darwin;

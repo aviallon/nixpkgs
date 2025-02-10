@@ -8418,6 +8418,14 @@ with pkgs;
     vulkanSupport = true;
   };
 
+  whisper-cpp-rocm = whisper-cpp.override {
+    rocmSupport = true;
+  };
+
+  whisper-cpp-cuda = whisper-cpp.override {
+    cudaSupport = true;
+  };
+
   watson-ruby = callPackage ../development/tools/misc/watson-ruby { };
 
   xmake = darwin.apple_sdk_11_0.callPackage ../development/tools/build-managers/xmake {
