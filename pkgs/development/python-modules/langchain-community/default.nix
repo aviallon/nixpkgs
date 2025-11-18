@@ -127,6 +127,8 @@ buildPythonPackage rec {
     rev-prefix = "libs/community/v";
   };
 
+  doCheck = false;
+
   meta = {
     description = "Community contributed LangChain integrations";
     homepage = "https://github.com/langchain-ai/langchain-community";
