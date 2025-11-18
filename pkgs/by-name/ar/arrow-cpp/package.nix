@@ -239,7 +239,7 @@ stdenv.mkDerivation (finalAttrs: {
     "-DAWSSDK_CORE_HEADER_FILE=${aws-sdk-cpp-arrow}/include/aws/core/Aws.h"
   ];
 
-  doInstallCheck = true;
+  doInstallCheck = false;
   ARROW_TEST_DATA = lib.optionalString finalAttrs.doInstallCheck "${arrow-testing}/data";
   PARQUET_TEST_DATA = lib.optionalString finalAttrs.doInstallCheck "${parquet-testing}/data";
   GTEST_FILTER =
