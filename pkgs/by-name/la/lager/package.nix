@@ -2,11 +2,14 @@
   lib,
   stdenv,
   fetchFromGitHub,
+  fetchpatch,
   cmake,
   boost,
   cereal,
   immer,
   zug,
+  catch2,
+  qt5,
 }:
 
 stdenv.mkDerivation (finalAttrs: {
@@ -20,6 +23,15 @@ stdenv.mkDerivation (finalAttrs: {
     hash = "sha256-ssGBQu8ba798MSTtJeCBE3WQ7AFfvSGLhZ7WBYHEgfw=";
   };
 
+  patches = lib.optionals finalAttrs.finalPackage.doCheck [
+    # https://github.com/arximboldi/lager/pull/233
+    (fetchpatch {
+      name = "Stop-using-Boost-system.patch";
+      url = "https://github.com/arximboldi/lager/commit/0eb1d3d3a6057723c5b57b3e0ee3e41924ff419a.patch";
+      hash = "sha256-peGpuyuCznCDqYo+9zk1FytLV+a6Um8fvjLmrm7Y2CI=";
+    })
+  ];
+
   strictDeps = true;
 
   nativeBuildInputs = [ cmake ];
@@ -31,17 +43,26 @@ stdenv.mkDerivation (finalAttrs: {
     zug
   ];
 
+  checkInputs = [
+    catch2
+    qt5.qtdeclarative
+  ];
+
   cmakeFlags = [
     (lib.cmakeBool "lager_BUILD_DEBUGGER_EXAMPLES" false)
     (lib.cmakeBool "lager_BUILD_DOCS" false)
     (lib.cmakeBool "lager_BUILD_EXAMPLES" false)
-    (lib.cmakeBool "lager_BUILD_TESTS" false)
+    (lib.cmakeBool "lager_BUILD_TESTS" finalAttrs.finalPackage.doCheck)
   ];
 
   # remove BUILD file to avoid conflicts with the build directory
   preConfigure = ''
     rm BUILD
   '';
+
+  doCheck = true;
+
+  dontWrapQtApps = true;
 
   meta = {
     changelog = "https://github.com/arximboldi/lager/releases/tag/${finalAttrs.src.tag}";
