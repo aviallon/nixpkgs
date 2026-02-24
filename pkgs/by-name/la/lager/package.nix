@@ -4,38 +4,49 @@
   fetchFromGitHub,
   cmake,
   boost,
+  cereal,
   immer,
   zug,
 }:
 
 stdenv.mkDerivation (finalAttrs: {
   pname = "lager";
-  version = "0.1.0";
+  version = "0.1.2";
 
   src = fetchFromGitHub {
     owner = "arximboldi";
     repo = "lager";
-    rev = "v${finalAttrs.version}";
-    hash = "sha256-KTHrVV/186l4klwlcfDwFsKVoOVqWCUPzHnIbWuatbg=";
+    tag = "v${finalAttrs.version}";
+    hash = "sha256-ssGBQu8ba798MSTtJeCBE3WQ7AFfvSGLhZ7WBYHEgfw=";
   };
+
+  strictDeps = true;
+
+  nativeBuildInputs = [ cmake ];
 
   buildInputs = [
     boost
+    cereal
     immer
     zug
   ];
-  nativeBuildInputs = [
-    cmake
-  ];
+
   cmakeFlags = [
-    "-Dlager_BUILD_EXAMPLES=OFF"
+    (lib.cmakeBool "lager_BUILD_DEBUGGER_EXAMPLES" false)
+    (lib.cmakeBool "lager_BUILD_DOCS" false)
+    (lib.cmakeBool "lager_BUILD_EXAMPLES" false)
+    (lib.cmakeBool "lager_BUILD_TESTS" false)
   ];
+
+  # remove BUILD file to avoid conflicts with the build directory
   preConfigure = ''
     rm BUILD
   '';
+
   meta = {
-    homepage = "https://github.com/arximboldi/lager";
+    changelog = "https://github.com/arximboldi/lager/releases/tag/${finalAttrs.src.tag}";
     description = "C++ library for value-oriented design using the unidirectional data-flow architecture — Redux for C++";
+    homepage = "https://sinusoid.es/lager/";
     license = lib.licenses.mit;
     maintainers = [ ];
   };
