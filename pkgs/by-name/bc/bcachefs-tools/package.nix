@@ -46,6 +46,12 @@ stdenv.mkDerivation (finalAttrs: {
     hash = "sha256-hbh4+vpZtVpda2yVZK+fkdPXWd5+GYLbWYPfJsYtPfM=";
   };
 
+  # Fix a btree node use-after-free that manifests as a general protection
+  # fault in bch2_btree_node_get() from the btree write-completion work.
+  # No upstream fix exists in v1.39.6 or master as of 2026-09-12 (see the
+  # patch's commit message); drop this when upstream lands a fix.
+  patches = [ ./bcachefs-btree-node-uaf.patch ];
+
   postPatch = ''
     substituteInPlace Makefile \
       --replace-fail "target/release/bcachefs" "target/${stdenv.hostPlatform.rust.rustcTargetSpec}/release/bcachefs"
