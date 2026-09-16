@@ -1,0 +1,393 @@
+From c0b74e96478701fadb0746b757481fdeff4b4d4e Mon Sep 17 00:00:00 2001
+From: Antoine Viallon <antoine@viallon.fr>
+Date: Wed, 16 Sep 2026 02:02:55 +0200
+Subject: [PATCH 1/2] btree: fix use-after-free of freed btree nodes
+
+Two changes:
+
+1. Restore bch2_trans_node_drop() and call it from
+   bch2_btree_node_free_inmem(). Commit 1d11a6cd6 replaced the by-identity
+   path cleanup with position-based migration plus
+   bch2_trans_node_verify_not_in_iters(); 03a91ec16 then downgraded the
+   latter's panic() to WARN_ONCE, knowingly allowing a freed node to be
+   used. A path whose ->pos no longer falls in any replacement node (e.g.
+   __bch2_btree_iter_peek_prev() leaves path->pos inconsistent, as its own
+   TODO documents) is not migrated, and because it may not hold the lock
+   (fast-relock cache) the verify stays silent. Dropping by identity is
+   what keeps such a path from later unpacking a freed node's bset.
+
+2. Validate btree_ptr_v2.mem_ptr before dereferencing it in
+   bch2_btree_node_get()/bch2_btree_node_get_noiter(). mem_ptr is a
+   lockless cache hint (only ever 0 or a struct btree *); a stale/garbage
+   value read out of a recycled node used to fault in b->hash_val before
+   any identity check. Fall through to the hash table lookup instead.
+
+Reported as: general protection fault in bch2_btree_node_get+0x62 on
+non-canonical address, Workqueue bcachefs_btree_write_complete
+btree_node_write_work -> btree_node_write_update_key ->
+bch2_btree_node_get_iter.
+---
+ fs/btree/cache.c    | 19 +++++++++++++++++++
+ fs/btree/interior.c |  8 ++++++++
+ fs/btree/iter.c     | 24 ++++++++++++++++++++++++
+ fs/btree/iter.h     |  1 +
+ 4 files changed, 52 insertions(+)
+
+diff --git a/fs/btree/cache.c b/fs/btree/cache.c
+index ab9b6a593..2441b6325 100644
+--- a/fs/btree/cache.c
++++ b/fs/btree/cache.c
+@@ -103,6 +103,7 @@
+ 
+ #include <linux/module.h>
+ #include <linux/prefetch.h>
++#include <linux/mm.h>
+ #include <linux/sched/mm.h>
+ #include <linux/swap.h>
+ 
+@@ -1382,6 +1383,20 @@ struct btree *bch2_btree_node_get(struct btree_trans *trans, struct btree_path *
+ 	EBUG_ON(level + 1 != path->level);
+ 
+ 	struct btree *b = btree_node_mem_ptr(k);
++
++	/*
++	 * mem_ptr is a lockless cache hint: it is only ever 0 or a struct
++	 * btree *. If it is not an addressable kernel address - a stale parent
++	 * key read out of a freed/recycled node, journal replay, or corrupted
++	 * metadata - do not dereference it. Fall through to
++	 * __bch2_btree_node_get(), which looks the node up by hash_val and
++	 * never trusts mem_ptr.
++	 */
++#ifdef __KERNEL__
++	if (unlikely(b && !virt_addr_valid(b)))
++		b = NULL;
++#endif
++
+ 	prefetch(&b->c.lock);
+ 
+ 	/*
+@@ -1447,6 +1462,10 @@ struct btree *bch2_btree_node_get_noiter(struct btree_trans *trans,
+ 	EBUG_ON(level >= BTREE_MAX_DEPTH);
+ 
+ 	b = btree_node_mem_ptr(k);
++#ifdef __KERNEL__
++	if (b && !virt_addr_valid(b))
++		b = NULL;
++#endif
+ 	if (b)
+ 		goto lock_node;
+ retry:
+diff --git a/fs/btree/interior.c b/fs/btree/interior.c
+index b122a755e..9b008da17 100644
+--- a/fs/btree/interior.c
++++ b/fs/btree/interior.c
+@@ -392,6 +392,14 @@ static void bch2_btree_node_free_inmem(struct btree_trans *trans,
+ 	__btree_node_free(trans, b);
+ 
+ 	bch2_btree_node_transition_state(&c->btree.cache, b, BTREE_NODE_CACHE_FREEABLE);
++
++	/*
++	 * Drop every path reference to @b by identity: bch2_trans_node_add()
++	 * only migrates paths whose ->pos falls in a replacement node, and a
++	 * stale path may not even hold the lock (fast-relock cache), so
++	 * bch2_trans_node_verify_not_in_iters() would stay silent.
++	 */
++	bch2_trans_node_drop(trans, b);
+ }
+ 
+ /*
+diff --git a/fs/btree/iter.c b/fs/btree/iter.c
+index e23c4b1d3..76602dc8d 100644
+--- a/fs/btree/iter.c
++++ b/fs/btree/iter.c
+@@ -861,6 +861,30 @@ void bch2_trans_node_add(struct btree_trans *trans, struct btree *b)
+ 	bch2_trans_revalidate_updates_in_node(trans, b);
+ }
+ 
++/*
++ * Clear every path reference to a node that is being freed, by identity.
++ *
++ * path->l[level].b doubles as a fast-relock cache and may be retained without
++ * a lock: when the cache slot is recycled for a different node, the cached
++ * pointer stale-coincides with whatever now occupies the slot. Position based
++ * migration (bch2_trans_node_add()) can't catch a path whose ->pos no longer
++ * falls in any replacement node - e.g. __bch2_btree_iter_peek_prev() leaves
++ * path->pos inconsistent - and bch2_trans_node_verify_not_in_iters() only
++ * warns about it. Dropping by identity is what keeps such a path from later
++ * unpacking (and dereferencing) a freed node's bset.
++ */
++void bch2_trans_node_drop(struct btree_trans *trans, struct btree *b)
++{
++	struct btree_path *path;
++	unsigned i, level = b->c.level;
++
++	trans_for_each_path(trans, path, i)
++		if (path->l[level].b == b) {
++			btree_node_unlock(trans, path, level);
++			path->l[level].b = ERR_PTR(-BCH_ERR_no_btree_node_init);
++		}
++}
++
+ void bch2_trans_node_verify_not_in_iters(struct btree_trans *trans, struct btree *b)
+ {
+ 	struct btree_path *path;
+diff --git a/fs/btree/iter.h b/fs/btree/iter.h
+index 8e4319148..aa43c8d66 100644
+--- a/fs/btree/iter.h
++++ b/fs/btree/iter.h
+@@ -580,6 +580,7 @@ void bch2_trans_downgrade(struct btree_trans *);
+ 
+ void bch2_trans_revalidate_updates_in_node(struct btree_trans *, struct btree *);
+ void bch2_trans_node_add(struct btree_trans *trans, struct btree *);
++void bch2_trans_node_drop(struct btree_trans *trans, struct btree *);
+ void bch2_trans_node_verify_not_in_iters(struct btree_trans *trans, struct btree *);
+ void bch2_trans_node_reinit_iter(struct btree_trans *, struct btree *);
+ 
+-- 
+2.55.0
+
+
+From e36bb213b16ce09bae53e79b795ad9b6b33010a2 Mon Sep 17 00:00:00 2001
+From: Antoine Viallon <antoine@viallon.fr>
+Date: Wed, 16 Sep 2026 09:55:24 +0200
+Subject: [PATCH 2/2] sb: let btree bitmap gc shrink shift
+
+Backport of koverstreet/bcachefs-tools PR #741 (commit aca1aa7f),
+cherry-picked cleanly onto our branch.
+
+btree_bitmap_gc rebuilt btree_allocated_bitmap while retaining the old
+btree_bitmap_shift: once the bitmap had grown coarse it could clear stale
+bits but still represented the same oversized range, so it rescheduled
+itself on every mount and 'mi_btree_bitmap sectors X -> X' never shrank.
+This is upstream issue koverstreet/bcachefs#1082.
+
+Rebuild the GC bitmap from exact btree-node pointers into a temporary
+bitmap/shift pair and commit both fields together. Normal marking and the
+marked-with-GC checks keep the persistent and in-flight granularities
+independent, so concurrent allocations are not reinterpreted during GC.
+
+Signed-off-by: Komzpa (PR author)
+---
+ fs/bcachefs.h   |   1 +
+ fs/init/dev.c   |   1 +
+ fs/sb/members.c | 101 +++++++++++++++++++++++++++++-------------------
+ fs/sb/members.h |  18 ++++++---
+ 4 files changed, 77 insertions(+), 44 deletions(-)
+
+diff --git a/fs/bcachefs.h b/fs/bcachefs.h
+index 1ac78cdd3..e085ca83f 100644
+--- a/fs/bcachefs.h
++++ b/fs/bcachefs.h
+@@ -544,6 +544,7 @@ struct bch_dev {
+ 	 */
+ 	struct bch_member_cpu	mi;
+ 	u64			btree_allocated_bitmap_gc;
++	u8			btree_allocated_bitmap_gc_shift;
+ 	atomic64_t		errors[BCH_MEMBER_ERROR_NR];
+ 	unsigned long		write_errors_start;
+ 
+diff --git a/fs/init/dev.c b/fs/init/dev.c
+index 37fb0b179..64993bae4 100644
+--- a/fs/init/dev.c
++++ b/fs/init/dev.c
+@@ -589,6 +589,7 @@ static struct bch_dev *__bch2_dev_alloc(struct bch_fs *c,
+ 
+ 	ca->mi = bch2_mi_to_cpu(member);
+ 	ca->btree_allocated_bitmap_gc = le64_to_cpu(member->btree_allocated_bitmap);
++	ca->btree_allocated_bitmap_gc_shift = member->btree_bitmap_shift;
+ 
+ 	for (i = 0; i < ARRAY_SIZE(member->errors); i++)
+ 		atomic64_set(&ca->errors[i], le64_to_cpu(member->errors[i]));
+diff --git a/fs/sb/members.c b/fs/sb/members.c
+index 271f4b788..8556a7ef5 100644
+--- a/fs/sb/members.c
++++ b/fs/sb/members.c
+@@ -654,49 +654,53 @@ bool bch2_dev_btree_bitmap_marked_nogc(struct bch_fs *c, struct bkey_s_c k)
+ 	return __bch2_dev_btree_bitmap_marked(c, k, false);
+ }
+ 
++static void bch2_btree_bitmap_mark_sectors(u64 *bitmap, u8 *shift,
++					   u64 start, unsigned sectors)
++{
++	u64 end = start + sectors;
++
++	int resize = ilog2(roundup_pow_of_two(end)) - (*shift + 6);
++	if (resize > 0) {
++		u64 old_bitmap = *bitmap;
++		u64 new_bitmap = 0;
++
++		for (unsigned i = 0; i < 64; i++)
++			if (old_bitmap & BIT_ULL(i))
++				new_bitmap |= BIT_ULL(i >> resize);
++
++		*bitmap = new_bitmap;
++		*shift += resize;
++	}
++
++	BUG_ON(*shift >= BCH_MI_BTREE_BITMAP_SHIFT_MAX);
++	BUG_ON(end > 64ULL << *shift);
++
++	for (unsigned bit = start >> *shift;
++	     (u64) bit << *shift < end;
++	     bit++)
++		*bitmap |= BIT_ULL(bit);
++}
++
+ static void __bch2_dev_btree_bitmap_mark(struct bch_dev *ca,
+ 					 struct bch_sb_field_members_v2 *mi,
+ 					 u64 start, unsigned sectors, struct sb_write *w)
+ {
+ 	struct bch_member *m = __bch2_members_v2_get_mut(mi, ca->dev_idx);
++	u64 old_bitmap = le64_to_cpu(m->btree_allocated_bitmap);
++	u8 old_shift = m->btree_bitmap_shift;
++	u64 new_bitmap = old_bitmap;
++	u8 new_shift = old_shift;
+ 
+-	u64 end = start + sectors;
+-
+-	int resize = ilog2(roundup_pow_of_two(end)) - (m->btree_bitmap_shift + 6);
+-	if (resize > 0) {
+-		u64 old_bitmap = le64_to_cpu(m->btree_allocated_bitmap);
+-		u64 new_bitmap = 0;
+-		u64 new_gc_bitmap = 0;
+-
+-		for (unsigned i = 0; i < 64; i++) {
+-			if (old_bitmap & BIT_ULL(i))
+-				new_bitmap |= BIT_ULL(i >> resize);
+-			if (ca->btree_allocated_bitmap_gc & BIT_ULL(i))
+-				new_gc_bitmap |= BIT_ULL(i >> resize);
+-		}
+-
++	bch2_btree_bitmap_mark_sectors(&new_bitmap, &new_shift, start, sectors);
++	if (new_bitmap != old_bitmap || new_shift != old_shift) {
+ 		m->btree_allocated_bitmap = cpu_to_le64(new_bitmap);
+-		m->btree_bitmap_shift += resize;
++		m->btree_bitmap_shift = new_shift;
+ 		sb_dirty(w);
+-
+-		ca->btree_allocated_bitmap_gc = new_gc_bitmap;
+ 	}
+ 
+-	BUG_ON(m->btree_bitmap_shift >= BCH_MI_BTREE_BITMAP_SHIFT_MAX);
+-	BUG_ON(end > 64ULL << m->btree_bitmap_shift);
+-
+-	for (unsigned bit = start >> m->btree_bitmap_shift;
+-	     (u64) bit << m->btree_bitmap_shift < end;
+-	     bit++) {
+-		__le64 b = cpu_to_le64(BIT_ULL(bit));
+-
+-		if (!(m->btree_allocated_bitmap & b)) {
+-			m->btree_allocated_bitmap |= b;
+-			sb_dirty(w);
+-		}
+-
+-		ca->btree_allocated_bitmap_gc |= BIT_ULL(bit);
+-	}
++	bch2_btree_bitmap_mark_sectors(&ca->btree_allocated_bitmap_gc,
++				       &ca->btree_allocated_bitmap_gc_shift,
++				       start, sectors);
+ }
+ 
+ void bch2_dev_btree_bitmap_mark_locked(struct bch_fs *c, struct bkey_s_c k, struct sb_write *w)
+@@ -720,6 +724,22 @@ void bch2_dev_btree_bitmap_mark(struct bch_fs *c, struct bkey_s_c k)
+ 	bch2_dev_btree_bitmap_mark_locked(c, k, &w);
+ }
+ 
++static void bch2_dev_btree_bitmap_gc_mark(struct bch_fs *c, struct bkey_s_c k)
++{
++	guard(memalloc_flags)(PF_MEMALLOC_NOFS);
++	guard(mutex_noio)(&c->sb_lock);
++	guard(rcu)();
++	bkey_for_each_ptr(bch2_bkey_ptrs_c(k), ptr) {
++		struct bch_dev *ca = bch2_dev_rcu_noerror(c, ptr->dev);
++		if (!ca)
++			continue;
++
++		bch2_btree_bitmap_mark_sectors(&ca->btree_allocated_bitmap_gc,
++					       &ca->btree_allocated_bitmap_gc_shift,
++					       ptr->offset, btree_sectors(c));
++	}
++}
++
+ static int btree_bitmap_gc_btree_level(struct btree_trans *trans,
+ 				       struct progress_indicator *progress,
+ 				       enum btree_id btree, unsigned level)
+@@ -728,8 +748,7 @@ static int btree_bitmap_gc_btree_level(struct btree_trans *trans,
+ 	CLASS(btree_node_iter, iter)(trans, btree, POS_MIN, 0, level, BTREE_ITER_prefetch);
+ 
+ 	try(for_each_btree_key_continue(trans, iter, 0, k, ({
+-		if (!bch2_dev_btree_bitmap_marked(c, k))
+-			bch2_dev_btree_bitmap_mark(c, k);
++		bch2_dev_btree_bitmap_gc_mark(c, k);
+ 
+ 		bch2_progress_update_iter(trans, progress, &iter);
+ 	})));
+@@ -743,8 +762,10 @@ int bch2_btree_bitmap_gc(struct bch_fs *c)
+ 
+ 	scoped_guard(mutex_noio, &c->sb_lock) {
+ 		guard(rcu)();
+-		for_each_member_device_rcu(c, ca, NULL)
++		for_each_member_device_rcu(c, ca, NULL) {
+ 			ca->btree_allocated_bitmap_gc = 0;
++			ca->btree_allocated_bitmap_gc_shift = 0;
++		}
+ 	}
+ 
+ 	{
+@@ -759,8 +780,7 @@ int bch2_btree_bitmap_gc(struct bch_fs *c)
+ 			struct btree *b;
+ 			try(lockrestart_do(trans, PTR_ERR_OR_ZERO(b = bch2_btree_iter_peek_node(&iter))));
+ 
+-			if (!bch2_dev_btree_bitmap_marked(c, bkey_i_to_s_c(&b->key)))
+-				bch2_dev_btree_bitmap_mark(c, bkey_i_to_s_c(&b->key));
++			bch2_dev_btree_bitmap_gc_mark(c, bkey_i_to_s_c(&b->key));
+ 		}
+ 	}
+ 
+@@ -772,10 +792,13 @@ int bch2_btree_bitmap_gc(struct bch_fs *c)
+ 		scoped_guard(rcu)
+ 			for_each_member_device_rcu(c, ca, NULL) {
+ 				sectors_marked_old += hweight64(ca->mi.btree_allocated_bitmap) << ca->mi.btree_bitmap_shift;
+-				sectors_marked_new += hweight64(ca->btree_allocated_bitmap_gc) << ca->mi.btree_bitmap_shift;
++				sectors_marked_new += hweight64(ca->btree_allocated_bitmap_gc) << ca->btree_allocated_bitmap_gc_shift;
+ 
+ 				struct bch_member *m = __bch2_members_v2_get_mut(mi, ca->dev_idx);
+ 				m->btree_allocated_bitmap = cpu_to_le64(ca->btree_allocated_bitmap_gc);
++				m->btree_bitmap_shift = ca->btree_allocated_bitmap_gc_shift;
++				ca->mi.btree_allocated_bitmap = ca->btree_allocated_bitmap_gc;
++				ca->mi.btree_bitmap_shift = ca->btree_allocated_bitmap_gc_shift;
+ 			}
+ 		bch2_write_super(c);
+ 	}
+diff --git a/fs/sb/members.h b/fs/sb/members.h
+index 2a39db39b..fd54b0090 100644
+--- a/fs/sb/members.h
++++ b/fs/sb/members.h
+@@ -463,11 +463,19 @@ static inline bool __bch2_dev_btree_bitmap_marked_sectors(struct bch_dev *ca, u6
+ 	for (unsigned bit = start >> ca->mi.btree_bitmap_shift;
+ 	     (u64) bit << ca->mi.btree_bitmap_shift < end;
+ 	     bit++)
+-		if (!(BIT_ULL(bit) &
+-		      ca->mi.btree_allocated_bitmap &
+-		      (with_gc
+-		       ? ca->btree_allocated_bitmap_gc
+-		       : ~0ULL)))
++		if (!(BIT_ULL(bit) & ca->mi.btree_allocated_bitmap))
++			return false;
++
++	if (!with_gc)
++		return true;
++
++	if (end > 64ULL << ca->btree_allocated_bitmap_gc_shift)
++		return false;
++
++	for (unsigned bit = start >> ca->btree_allocated_bitmap_gc_shift;
++	     (u64) bit << ca->btree_allocated_bitmap_gc_shift < end;
++	     bit++)
++		if (!(BIT_ULL(bit) & ca->btree_allocated_bitmap_gc))
+ 			return false;
+ 	return true;
+ }
+-- 
+2.55.0
+

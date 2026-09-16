@@ -46,11 +46,15 @@ stdenv.mkDerivation (finalAttrs: {
     hash = "sha256-hbh4+vpZtVpda2yVZK+fkdPXWd5+GYLbWYPfJsYtPfM=";
   };
 
-  # Fix a btree node use-after-free that manifests as a general protection
-  # fault in bch2_btree_node_get() from the btree write-completion work.
-  # No upstream fix exists in v1.39.6 or master as of 2026-09-12 (see the
-  # patch's commit message); drop this when upstream lands a fix.
-  patches = [ ./bcachefs-btree-node-uaf.patch ];
+  # Two local backports against bcachefs-tools 1.39.5:
+  #  - a btree node use-after-free that manifests as a general protection
+  #    fault in bch2_btree_node_get() from the btree write-completion work;
+  #  - btree_bitmap_gc being unable to shrink btree_bitmap_shift, so the
+  #    'N marked in bitmap' range never shrank and gc rescheduled forever
+  #    (upstream issue koverstreet/bcachefs#1082, fix from open PR
+  #    koverstreet/bcachefs-tools#741).
+  # Drop these when upstream lands fixes.
+  patches = [ ./bcachefs-btree-fixes.patch ];
 
   postPatch = ''
     substituteInPlace Makefile \
