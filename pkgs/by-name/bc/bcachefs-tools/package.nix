@@ -42,8 +42,8 @@ stdenv.mkDerivation (finalAttrs: {
   src = fetchFromGitHub {
     owner = "aviallon";
     repo = "bcachefs-tools";
-    rev = "b1bf09c30fe281aa07f6c4d00ab64a20c644ce43";
-    hash = "sha256-gQ3lz+4YRyQYSC5bYXuWDdNAZ4RqTnLZEs108t1EFBA=";
+    rev = "ab8712d2b7dca51a33895cd1827e7340f113c4b1";
+    hash = "sha256-maESxQnkegQKRne3IyjQYjr7En1hIPA0hoMa+gjC3kQ=";
   };
 
   cargoDeps = rustPlatform.fetchCargoVendor {
