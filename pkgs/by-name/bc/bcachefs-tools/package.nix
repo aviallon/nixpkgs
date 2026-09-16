@@ -32,13 +32,18 @@
 
 stdenv.mkDerivation (finalAttrs: {
   pname = "bcachefs-tools";
-  version = "1.39.6";
+  version = "1.39.5";
 
+  # Pinned to our bcachefs-tools fork, branch nixos/1.39.5-backports:
+  # v1.39.5 plus two backports (btree node use-after-free GPF in
+  # bch2_btree_node_get(); btree_bitmap_gc unable to shrink
+  # btree_bitmap_shift, upstream issue koverstreet/bcachefs#1082 / open PR
+  # koverstreet/bcachefs-tools#741). Drop once upstream ships fixes.
   src = fetchFromGitHub {
-    owner = "koverstreet";
+    owner = "aviallon";
     repo = "bcachefs-tools";
-    tag = "v${finalAttrs.version}";
-    hash = "sha256-cBYn/g6eLT5rTumo4Y24rWSHS2Sc7gFthPuCg1AQ22k=";
+    rev = "b1bf09c30fe281aa07f6c4d00ab64a20c644ce43";
+    hash = "sha256-gQ3lz+4YRyQYSC5bYXuWDdNAZ4RqTnLZEs108t1EFBA=";
   };
 
   cargoDeps = rustPlatform.fetchCargoVendor {
