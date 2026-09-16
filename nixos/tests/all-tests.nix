@@ -325,6 +325,7 @@ in
   bazarr = runTest ./bazarr.nix;
   bcache = runTestOn [ "x86_64-linux" "aarch64-linux" ] ./bcache.nix;
   bcachefs = runTestOn [ "x86_64-linux" "aarch64-linux" ] ./bcachefs.nix;
+  bcachefs-recovery = runTestOn [ "x86_64-linux" "aarch64-linux" ] ./bcachefs-recovery.nix;
   beanstalkd = runTest ./beanstalkd.nix;
   bees = runTest ./bees.nix;
   benchexec = runTest ./benchexec.nix;
