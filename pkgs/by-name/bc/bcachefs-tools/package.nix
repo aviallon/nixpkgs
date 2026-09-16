@@ -34,27 +34,22 @@ stdenv.mkDerivation (finalAttrs: {
   pname = "bcachefs-tools";
   version = "1.39.5";
 
+  # Pinned to our bcachefs-tools fork, branch nixos/1.39.5-backports:
+  # v1.39.5 plus two backports (btree node use-after-free GPF in
+  # bch2_btree_node_get(); btree_bitmap_gc unable to shrink
+  # btree_bitmap_shift, upstream issue koverstreet/bcachefs#1082 / open PR
+  # koverstreet/bcachefs-tools#741). Drop once upstream ships fixes.
   src = fetchFromGitHub {
-    owner = "koverstreet";
+    owner = "aviallon";
     repo = "bcachefs-tools";
-    tag = "v${finalAttrs.version}";
-    hash = "sha256-k9JW6GMXFwphkYGcYMwA59uafNj0EV96wTnbzeuVM1w=";
+    rev = "b1bf09c30fe281aa07f6c4d00ab64a20c644ce43";
+    hash = "sha256-gQ3lz+4YRyQYSC5bYXuWDdNAZ4RqTnLZEs108t1EFBA=";
   };
 
   cargoDeps = rustPlatform.fetchCargoVendor {
     inherit (finalAttrs) src;
     hash = "sha256-hbh4+vpZtVpda2yVZK+fkdPXWd5+GYLbWYPfJsYtPfM=";
   };
-
-  # Two local backports against bcachefs-tools 1.39.5:
-  #  - a btree node use-after-free that manifests as a general protection
-  #    fault in bch2_btree_node_get() from the btree write-completion work;
-  #  - btree_bitmap_gc being unable to shrink btree_bitmap_shift, so the
-  #    'N marked in bitmap' range never shrank and gc rescheduled forever
-  #    (upstream issue koverstreet/bcachefs#1082, fix from open PR
-  #    koverstreet/bcachefs-tools#741).
-  # Drop these when upstream lands fixes.
-  patches = [ ./bcachefs-btree-fixes.patch ];
 
   postPatch = ''
     substituteInPlace Makefile \
