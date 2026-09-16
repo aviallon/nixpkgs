@@ -144,6 +144,7 @@ stdenv.mkDerivation (finalAttrs: {
 
     tests = {
       smoke-test = nixosTests.bcachefs;
+      recovery = nixosTests."bcachefs-recovery";
       inherit (nixosTests.installer) bcachefsSimple bcachefsEncrypted bcachefsMulti;
     };
 
