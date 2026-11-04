@@ -32,7 +32,7 @@
 
 stdenv.mkDerivation (finalAttrs: {
   pname = "bcachefs-tools";
-  version = "1.39.5";
+  version = "1.39.7+aviallon1";
 
   # Pinned to our bcachefs-tools fork, branch nixos/1.39.5-backports:
   # v1.39.5 plus two backports (btree node use-after-free GPF in
@@ -42,13 +42,13 @@ stdenv.mkDerivation (finalAttrs: {
   src = fetchFromGitHub {
     owner = "aviallon";
     repo = "bcachefs-tools";
-    rev = "ab8712d2b7dca51a33895cd1827e7340f113c4b1";
-    hash = "sha256-maESxQnkegQKRne3IyjQYjr7En1hIPA0hoMa+gjC3kQ=";
+    rev = "bb0262015ab9932a041e491bacc7df964dcd9758";
+    hash = "sha256-akfCa1S5mlGVkQzCx416FSMqe6/2+4geSapQm4SEdxI=";
   };
 
   cargoDeps = rustPlatform.fetchCargoVendor {
     inherit (finalAttrs) src;
-    hash = "sha256-djiIwZie9HjQ/+bCEGniMFkJA66oI0n+9y9Iax4GHOM=";
+    hash = "sha256-4ZStyYaT+6Suup1ue2wFFCTAlnsnEO9WaUJHe47BKXY=";
   };
 
   postPatch = ''
