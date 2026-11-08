@@ -1,0 +1,29 @@
+`terakan_hw_config_sqk_get_stage_srvs_()` handles every `mesa_shader_stage` it can
+be given and signals the rest with an `assert(!"Unsupported shader stage")`.  In
+a non-void function that assert is the *only* thing keeping the compiler from
+seeing the end of the function, so a build with assertions disabled -- which is
+what nixpkgs does, via `-Db_ndebug=true` -- turns the path into undefined
+behaviour and trips `-Werror=return-type`:
+
+  ../src/amd/terascale/vulkan/terakan_hw_config_sqk.h:264:1: error:
+    control reaches end of non-void function [-Werror=return-type]
+
+`UNREACHABLE()` is Mesa's idiom for exactly this case (util/macros.h documents it
+as "useful for suppressing 'control reaches end of non-void function'
+warnings"): it still asserts when assertions are enabled, and marks the path
+unreachable for the compiler otherwise.
+
+--- 
+diff --git a/src/amd/terascale/vulkan/terakan_hw_config_sqk.h b/src/amd/terascale/vulkan/terakan_hw_config_sqk.h
+index f5d369c06ad..ada5006f1de 100644
+--- a/src/amd/terascale/vulkan/terakan_hw_config_sqk.h
++++ b/src/amd/terascale/vulkan/terakan_hw_config_sqk.h
+@@ -259,7 +259,7 @@ terakan_hw_config_sqk_get_stage_srvs_(struct terakan_hw_config_sqk const * const
+    case MESA_SHADER_COMPUTE:
+       return config->srvs_cs_;
+    default:
+-      assert(!"Unsupported shader stage");
++      UNREACHABLE("Unsupported shader stage");
+    }
+ }
+ 
