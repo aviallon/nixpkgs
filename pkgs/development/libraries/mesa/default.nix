@@ -51,6 +51,17 @@
   enablePatentEncumberedCodecs ? true,
   withValgrind ? lib.meta.availableOn stdenv.hostPlatform valgrind-light,
 
+  # Shader compiler tools and disassemblers to build and install, moved to the
+  # `cross_tools` output. Upstream asks for every family it supports, including
+  # the ones whose drivers are not being built, so build setups that narrow
+  # `galliumDrivers` can drop tools nothing in their build can use.
+  # Deliberately not derived from `galliumDrivers`: a cross build consumes the
+  # host Mesa's `cross_tools` for drivers of its own choosing.
+  mesaTools ? [
+    "asahi"
+    "panfrost"
+  ],
+
   # We enable as many drivers as possible here, to build cross tools
   # and support emulation use cases (emulated x86_64 on aarch64, etc)
   galliumDrivers ? [
@@ -222,11 +233,17 @@ stdenv.mkDerivation (finalAttrs: {
     # used with a virtio-gpu device supporting drm native context.) This option
     # is ignored when freedreno is not being built.
     (lib.mesonOption "freedreno-kmds" "msm,kgsl,virtio,wsl")
-
-    # Enable virtio-gpu kernel mode driver (native context) support for amdgpu as well.
-    # This option is ignored when RadeonSI/RADV are not being built.
+  ]
+  # Enable virtio-gpu kernel mode driver (native context) support for amdgpu as
+  # well.  Only RadeonSI/RADV can use it, so it is not passed at all when
+  # neither of them is built.  (Note for downstream trees based on Mesa main:
+  # 27.0 replaced this boolean with the `amd-options` array and rejects the
+  # deprecated spelling outright, so there the equivalent is
+  # `-Damd-options=virtio` — a flag only such a tree can add.)
+  ++ lib.optionals (lib.elem "radeonsi" galliumDrivers || lib.elem "amd" vulkanDrivers) [
     (lib.mesonBool "amdgpu-virtio" true)
-
+  ]
+  ++ [
     # Required for OpenCL
     (lib.mesonOption "clang-libdir" "${lib.getLib llvmPackages.clang-unwrapped}/lib")
 
@@ -251,12 +268,14 @@ stdenv.mkDerivation (finalAttrs: {
   ++ lib.optionals enablePatentEncumberedCodecs [
     (lib.mesonOption "video-codecs" "all")
   ]
-  ++ lib.optionals (!needNativeCLC) [
+  ++ lib.optionals (!needNativeCLC) (
     # Build and install extra tools for cross
-    (lib.mesonOption "tools" "asahi,panfrost")
-    (lib.mesonBool "install-mesa-clc" true)
-    (lib.mesonBool "install-precomp-compiler" true)
-  ]
+    lib.optional (mesaTools != [ ]) (lib.mesonOption "tools" (lib.concatStringsSep "," mesaTools))
+    ++ [
+      (lib.mesonBool "install-mesa-clc" true)
+      (lib.mesonBool "install-precomp-compiler" true)
+    ]
+  )
   ++ lib.optionals needNativeCLC [
     (lib.mesonOption "mesa-clc" "system")
     (lib.mesonOption "precomp-compiler" "system")
