@@ -1,0 +1,109 @@
+diff --git a/src/mbpfan.c b/src/mbpfan.c
+index 4527a25..48ea311 100644
+--- a/src/mbpfan.c
++++ b/src/mbpfan.c
+@@ -78,6 +78,17 @@ t_sensors *sensors = NULL;
+ t_fans *fans = NULL;
+ char applesmc_path[PATH_MAX];
+ char applesmc_fan_path[PATH_MAX];
++char applesmc_pwm_path[PATH_MAX];
++
++/*
++ * Kernel >= 7.3 ("hwmon: (applesmc) Convert to
++ * hwmon_device_register_with_info") registers the applesmc fan attributes on
++ * a hwmon child device instead of the platform device and renames them:
++ * fan*_output -> fan*_target and fan*_manual -> pwm*_enable, where
++ * 1 = manual and 2 = automatic. applesmc_hwmon_abi records which layout is in
++ * use; applesmc_path then points at the hwmon directory.
++ */
++bool applesmc_hwmon_abi = false;
+ 
+ 
+ char *smprintf(const char *fmt, ...)
+@@ -279,9 +290,10 @@ t_fans *retrieve_fans()
+     char *path_fan_min = NULL;
+ 
+     const char *path_begin = (const char *) &applesmc_fan_path;
+-    const char *path_output_end = "_output";
++    const char *path_pwm_begin = (const char *) &applesmc_pwm_path;
++    const char *path_output_end = applesmc_hwmon_abi ? "_target" : "_output";
+     const char *path_label_end = "_label";
+-    const char *path_man_end = "_manual";
++    const char *path_man_end = applesmc_hwmon_abi ? "_enable" : "_manual";
+     const char *path_max_speed = "_max";
+     const char *path_min_speed = "_min";
+ 
+@@ -292,7 +304,7 @@ t_fans *retrieve_fans()
+ 
+         path_output = smprintf("%s%d%s", path_begin, counter, path_output_end);
+         path_label = smprintf("%s%d%s", path_begin, counter, path_label_end);
+-        path_manual = smprintf("%s%d%s", path_begin, counter, path_man_end);
++        path_manual = smprintf("%s%d%s", path_pwm_begin, counter, path_man_end);
+         path_fan_min = smprintf("%s%d%s", path_begin, counter, path_min_speed);
+         path_fan_max = smprintf("%s%d%s", path_begin, counter, path_max_speed);
+ 
+@@ -374,7 +386,15 @@ static void set_fans_mode(t_fans *fans, int mode)
+         file = fopen(tmp->fan_manual_path, "rw+");
+ 
+         if (file != NULL) {
+-            fprintf(file, "%d", mode);
++            /*
++             * The legacy fan*_manual attribute uses 1 = manual, 0 = automatic
++             * while the hwmon pwm*_enable attribute uses 1 = manual,
++             * 2 = automatic. set_fans_man() and set_fans_auto() both come
++             * through here, so translate the automatic value only.
++             */
++            int value = (applesmc_hwmon_abi && mode == 0) ? 2 : mode;
++
++            fprintf(file, "%d", value);
+             fclose(file);
+         }
+ 
+@@ -585,9 +605,46 @@ void check_requirements(const char *program_path)
+     closedir(dir);
+ 
+     if (strlen(applesmc_path) != 0) {
++        /**
++         * Kernel >= 7.3 moved the applesmc attributes into a hwmon child
++         * device. Prefer that layout when its fan1_target attribute is
++         * present and keep the legacy one as fallback. This has to run before
++         * applesmc_fan_path and applesmc_pwm_path are derived below.
++         */
++        char *hwmon_path = smprintf("%s/hwmon", (char *) &applesmc_path);
++        DIR *hwmon_dir = opendir(hwmon_path);
++
++        if (hwmon_dir != NULL) {
++            struct dirent *ent;
++
++            while ((ent = readdir(hwmon_dir)) != NULL) {
++                if (strncmp("hwmon", (const char *) &ent->d_name, 5) != 0) {
++                    continue;
++                }
++
++                char *fan_target = smprintf("%s/%s/fan1_target", hwmon_path, (char *) &ent->d_name);
++                int readable = access(fan_target, R_OK);
++                free(fan_target);
++
++                if (readable == 0) {
++                    snprintf((char *) &applesmc_path, PATH_MAX, "%s/%s", hwmon_path, (char *) &ent->d_name);
++                    applesmc_hwmon_abi = true;
++                    break;
++                }
++            }
++
++            closedir(hwmon_dir);
++        }
++
++        free(hwmon_path);
++
+         strncpy((char *) &applesmc_fan_path, (char *) &applesmc_path, PATH_MAX);
+         strcat((char *) &applesmc_fan_path, "/fan");
+-        if (verbose) mbp_log(LOG_INFO, "applesmc device path: %s", (char *) &applesmc_path);
++
++        strncpy((char *) &applesmc_pwm_path, (char *) &applesmc_path, PATH_MAX);
++        strcat((char *) &applesmc_pwm_path, applesmc_hwmon_abi ? "/pwm" : "/fan");
++
++        if (verbose) mbp_log(LOG_INFO, "applesmc device path: %s (%s ABI)", (char *) &applesmc_path, applesmc_hwmon_abi ? "hwmon" : "legacy");
+ 
+     } else {
+         mbp_log(LOG_ERR, "%s needs applesmc support. Please either load it or build it into the kernel. Exiting.", program_path);

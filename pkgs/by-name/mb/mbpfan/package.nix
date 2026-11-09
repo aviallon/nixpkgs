@@ -13,6 +13,13 @@ stdenv.mkDerivation (finalAttrs: {
     rev = "v${finalAttrs.version}";
     sha256 = "sha256-F9IWUcILOuLn5K4zRSU5jn+1Wk1xy0CONSI6JTXU2pA=";
   };
+  patches = [
+    # Support the applesmc hwmon ABI introduced in Linux 7.3 (fan*_target /
+    # pwm*_enable) while keeping the legacy fan*_output / fan*_manual layout.
+    # Not yet submitted upstream; mbpfan master is still legacy-only.
+    ./applesmc-hwmon-abi.patch
+  ];
+
   installPhase = ''
     mkdir -p $out/bin $out/etc
     cp bin/mbpfan $out/bin
