@@ -1,0 +1,390 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Peter Huang <peter.huang@ui.com>
+Date: Mon, 12 Oct 2026 10:15:52 +0800
+Subject: [PATCH] [cache] Fix unclean-shutdown dirty-bitset handling in
+ cache_check and cache_dump
+
+The cache target's on-disk dirty bitset is only written on a clean suspend.
+After an unclean shutdown the kernel ignores it entirely and assumes every
+mapped cache block is dirty, so the metadata legitimately contains dirty bits
+for blocks that are no longer mapped. thin-provisioning-tools treated that
+stale bit as a fatal inconsistency:
+
+  * cache_check cross-checked the dirty bitset against the mapping tree and
+    failed (exit 64) on a dirtied-but-unmapped block, so LVM refused to
+    activate the cached LV and the machine was unbootable after a power loss;
+  * cache_dump (and therefore cache_repair/cache_restore) copied those stale
+    bits and wrote a superblock with clean_shutdown=1, so blocks dirtied after
+    the last suspend came back marked clean and were never written back.
+
+With this change both tools honour the kernel's rule when, and only when, the
+superblock says the shutdown was not clean:
+
+  * cache_check gains a check_dirty_bits flag on format2::MappingChecker, set
+    from sb.flags.clean_shutdown, and skips the dirty-bit cross-check when the
+    shutdown was unclean. A stale bit with clean_shutdown=1 is still fatal.
+  * cache_dump computes all_dirty = !sb.flags.clean_shutdown and emits every
+    mapping with dirty="true" for both the format1 and the format2 emitters,
+    so a dump/restore round trip preserves the kernel's "everything is dirty"
+    state instead of silently losing it.
+
+Upstream: https://github.com/jthornber/thin-provisioning-tools/issues/330
+Upstream fix: https://github.com/jthornber/thin-provisioning-tools/pull/331
+
+This is a squash of the two commits of PR #331, rebased onto v1.3.4, where
+they apply without conflict. Authorship is upstream's.
+
+(cherry picked from commit 85b423e1177a271e603b54b73e732752d1bc9616)
+(cherry picked from commit 7230adedeeef1df66b7865d476aed73607c1714e)
+---
+ src/cache/check.rs    | 25 +++++++++++++--
+ src/cache/dump.rs     | 24 +++++++++++---
+ tests/cache_check.rs  | 31 ++++++++++++++++++
+ tests/cache_dump.rs   | 34 ++++++++++++++++++++
+ tests/common/cache.rs | 73 +++++++++++++++++++++++++++++++++++++++++++
+ 5 files changed, 179 insertions(+), 8 deletions(-)
+
+diff --git a/src/cache/check.rs b/src/cache/check.rs
+index 18cfaa4..7b4c708 100644
+--- a/src/cache/check.rs
++++ b/src/cache/check.rs
+@@ -123,6 +123,10 @@ mod format2 {
+ 
+     pub struct MappingChecker {
+         nr_origin_blocks: u64,
++        // The dirty bitset is only written on a clean shutdown; after an
++        // unclean one the kernel ignores it and treats every mapped block as
++        // dirty, so stale bits are expected and must not be cross-checked.
++        check_dirty_bits: bool,
+         inner: Mutex<Inner>,
+     }
+ 
+@@ -132,10 +136,15 @@ mod format2 {
+     }
+ 
+     impl MappingChecker {
+-        pub fn new(nr_origin_blocks: Option<u64>, dirty_bits: CheckedBitSet) -> MappingChecker {
++        pub fn new(
++            nr_origin_blocks: Option<u64>,
++            dirty_bits: CheckedBitSet,
++            check_dirty_bits: bool,
++        ) -> MappingChecker {
+             if let Some(n) = nr_origin_blocks {
+                 MappingChecker {
+                     nr_origin_blocks: n,
++                    check_dirty_bits,
+                     inner: Mutex::new(Inner {
+                         seen_oblocks: FixedBitSet::with_capacity(n as usize),
+                         dirty_bits,
+@@ -144,6 +153,7 @@ mod format2 {
+             } else {
+                 MappingChecker {
+                     nr_origin_blocks: MAX_ORIGIN_BLOCKS,
++                    check_dirty_bits,
+                     inner: Mutex::new(Inner {
+                         seen_oblocks: FixedBitSet::with_capacity(DEFAULT_OBLOCKS),
+                         dirty_bits,
+@@ -200,7 +210,12 @@ mod format2 {
+             let cbegin = index as u32 * b.header.max_entries;
+             let cend = cbegin + b.header.nr_entries;
+             for (m, cblock) in b.values.iter().zip(cbegin..cend) {
+-                if let Err(e) = self.check_flags(m, inner.dirty_bits.contains(cblock as usize)) {
++                let dirty_bit = if self.check_dirty_bits {
++                    inner.dirty_bits.contains(cblock as usize)
++                } else {
++                    None
++                };
++                if let Err(e) = self.check_flags(m, dirty_bit) {
+                     errs.push(e);
+                 }
+                 if let Err(e) = self.check_oblock(m, &mut inner.seen_oblocks) {
+@@ -324,7 +339,11 @@ pub fn check(opts: CacheCheckOptions) -> anyhow::Result<()> {
+                 if let Some(e) = err {
+                     ctx.report.fatal(&format!("{}", e));
+                 }
+-                let c = format2::MappingChecker::new(nr_origin_blocks, dirty_bits);
++                let c = format2::MappingChecker::new(
++                    nr_origin_blocks,
++                    dirty_bits,
++                    sb.flags.clean_shutdown,
++                );
+                 if let Err(e) = w.walk(&c, sb.mapping_root) {
+                     ctx.report.fatal(&format!("{}", e));
+                 }
+diff --git a/src/cache/dump.rs b/src/cache/dump.rs
+index 2703be0..e491158 100644
+--- a/src/cache/dump.rs
++++ b/src/cache/dump.rs
+@@ -29,12 +29,18 @@ mod format1 {
+     }
+ 
+     pub struct MappingEmitter<'a> {
++        all_dirty: bool,
+         inner: Mutex<Inner<'a>>,
+     }
+ 
+     impl<'a> MappingEmitter<'a> {
+-        pub fn new(nr_entries: usize, visitor: &'a mut dyn MetadataVisitor) -> MappingEmitter<'a> {
++        pub fn new(
++            nr_entries: usize,
++            all_dirty: bool,
++            visitor: &'a mut dyn MetadataVisitor,
++        ) -> MappingEmitter<'a> {
+             MappingEmitter {
++                all_dirty,
+                 inner: Mutex::new(Inner {
+                     visitor,
+                     valid_mappings: FixedBitSet::with_capacity(nr_entries),
+@@ -60,7 +66,7 @@ mod format1 {
+                 let m = ir::Map {
+                     cblock,
+                     oblock: map.oblock,
+-                    dirty: map.is_dirty(),
++                    dirty: self.all_dirty || map.is_dirty(),
+                 };
+ 
+                 let mut inner = self.inner.lock().unwrap();
+@@ -88,6 +94,7 @@ mod format2 {
+     }
+ 
+     pub struct MappingEmitter<'a> {
++        all_dirty: bool,
+         inner: Mutex<Inner<'a>>,
+     }
+ 
+@@ -95,9 +102,11 @@ mod format2 {
+         pub fn new(
+             nr_entries: usize,
+             dirty_bits: CheckedBitSet,
++            all_dirty: bool,
+             visitor: &'a mut dyn MetadataVisitor,
+         ) -> MappingEmitter<'a> {
+             MappingEmitter {
++                all_dirty,
+                 inner: Mutex::new(Inner {
+                     visitor,
+                     dirty_bits,
+@@ -124,7 +133,8 @@ mod format2 {
+                 let mut inner = self.inner.lock().unwrap();
+ 
+                 // default to dirty if the bitset is damaged
+-                let dirty = inner.dirty_bits.contains(cblock as usize).unwrap_or(true);
++                let dirty =
++                    self.all_dirty || inner.dirty_bits.contains(cblock as usize).unwrap_or(true);
+ 
+                 let m = ir::Map {
+                     cblock,
+@@ -184,10 +194,11 @@ fn dump_v1_mappings(
+     out: &mut dyn MetadataVisitor,
+     mapping_root: u64,
+     cache_blocks: u32,
++    all_dirty: bool,
+     repair: bool,
+ ) -> anyhow::Result<FixedBitSet> {
+     let ablocks = collect_array_blocks_with_path(engine.as_ref(), repair, mapping_root)?;
+-    let emitter = format1::MappingEmitter::new(cache_blocks as usize, out);
++    let emitter = format1::MappingEmitter::new(cache_blocks as usize, all_dirty, out);
+     walk_array_blocks(engine, ablocks, &emitter)?;
+ 
+     Ok(emitter.get_valid())
+@@ -199,6 +210,7 @@ fn dump_v2_mappings(
+     mapping_root: u64,
+     cache_blocks: u32,
+     dirty_root: Option<u64>,
++    all_dirty: bool,
+     repair: bool,
+ ) -> anyhow::Result<FixedBitSet> {
+     // We need to walk the dirty bitset first.
+@@ -218,7 +230,7 @@ fn dump_v2_mappings(
+     };
+ 
+     let ablocks = collect_array_blocks_with_path(engine.as_ref(), repair, mapping_root)?;
+-    let emitter = format2::MappingEmitter::new(cache_blocks as usize, dirty_bits, out);
++    let emitter = format2::MappingEmitter::new(cache_blocks as usize, dirty_bits, all_dirty, out);
+     walk_array_blocks(engine, ablocks, &emitter)?;
+ 
+     Ok(emitter.get_valid())
+@@ -340,6 +352,7 @@ pub fn dump_metadata(
+             out,
+             sb.mapping_root,
+             sb.cache_blocks,
++            !sb.flags.clean_shutdown,
+             repair,
+         )?,
+         2 => dump_v2_mappings(
+@@ -348,6 +361,7 @@ pub fn dump_metadata(
+             sb.mapping_root,
+             sb.cache_blocks,
+             sb.dirty_root,
++            !sb.flags.clean_shutdown,
+             repair,
+         )?,
+         v => {
+diff --git a/tests/cache_check.rs b/tests/cache_check.rs
+index 37509e5..0d2f8a1 100644
+--- a/tests/cache_check.rs
++++ b/tests/cache_check.rs
+@@ -255,6 +255,37 @@ fn dirty_bitset_not_found_should_fail() -> Result<()> {
+     Ok(())
+ }
+ 
++//------------------------------------------
++// test stale dirty bits on unmapped blocks
++
++// The kernel only writes the dirty bitset on a clean suspend and ignores it
++// after an unclean shutdown, so a set bit on an unmapped block is expected
++// then.
++#[test]
++fn stale_dirty_bits_without_clean_shutdown_should_pass() -> Result<()> {
++    let mut td = TestDir::new()?;
++    let md = mk_valid_md(&mut td)?;
++    assert!(unmap_dirty_blocks(&md, 16)? > 0);
++    unset_clean_shutdown(&md)?;
++    run_ok(cache_check_cmd(args![&md]))?;
++    run_ok(cache_check_cmd(args![
++        "-q",
++        "--clear-needs-check-flag",
++        &md
++    ]))?;
++    Ok(())
++}
++
++#[test]
++fn dirty_bits_on_unmapped_blocks_with_clean_shutdown_should_fail() -> Result<()> {
++    let mut td = TestDir::new()?;
++    let md = mk_valid_md(&mut td)?;
++    assert!(get_clean_shutdown(&md)?);
++    assert!(unmap_dirty_blocks(&md, 16)? > 0);
++    run_fail(cache_check_cmd(args![&md]))?;
++    Ok(())
++}
++
+ //------------------------------------------
+ // test clear-needs-check
+ 
+diff --git a/tests/cache_dump.rs b/tests/cache_dump.rs
+index 8bccab4..1b3ba66 100644
+--- a/tests/cache_dump.rs
++++ b/tests/cache_dump.rs
+@@ -107,6 +107,40 @@ fn dump_restore_cycle() -> Result<()> {
+     Ok(())
+ }
+ 
++//------------------------------------------
++// test dirty flags with and without clean shutdown
++
++fn count_mappings(xml: &str, dirty: bool) -> usize {
++    xml.matches(&format!("dirty=\"{}\"", dirty)).count()
++}
++
++#[test]
++fn dump_keeps_dirty_flags_with_clean_shutdown() -> Result<()> {
++    let mut td = TestDir::new()?;
++    let md = mk_valid_md(&mut td)?;
++    assert!(get_clean_shutdown(&md)?);
++    let xml = run_ok(cache_dump_cmd(args![&md]))?;
++    assert!(count_mappings(&xml, true) > 0);
++    assert!(count_mappings(&xml, false) > 0);
++    Ok(())
++}
++
++// The kernel treats every mapped block as dirty after an unclean shutdown,
++// since the dirty bitset is only written on a clean suspend.
++#[test]
++fn dump_marks_all_mappings_dirty_without_clean_shutdown() -> Result<()> {
++    let mut td = TestDir::new()?;
++    let md = mk_valid_md(&mut td)?;
++    let before = run_ok(cache_dump_cmd(args![&md]))?;
++    let nr_mappings = count_mappings(&before, true) + count_mappings(&before, false);
++
++    unset_clean_shutdown(&md)?;
++    let after = run_ok(cache_dump_cmd(args![&md]))?;
++    assert_eq!(count_mappings(&after, false), 0);
++    assert_eq!(count_mappings(&after, true), nr_mappings);
++    Ok(())
++}
++
+ //------------------------------------------
+ // test no stderr on broken pipe errors
+ 
+diff --git a/tests/common/cache.rs b/tests/common/cache.rs
+index 31a8f63..a60d4f3 100644
+--- a/tests/common/cache.rs
++++ b/tests/common/cache.rs
+@@ -92,3 +92,76 @@ pub fn set_needs_check(md: &Path) -> Result<()> {
+ }
+ 
+ //-----------------------------------------------
++
++// Invalidates up to `nr` mappings whose dirty bit is set, leaving the dirty
++// bitset untouched. This mimics the kernel demoting blocks after the dirty
++// bitset was last written: a set dirty bit on an unmapped cache block.
++// Returns the number of mappings invalidated. Format 2 metadata only.
++pub fn unmap_dirty_blocks(md: &Path, nr: usize) -> Result<usize> {
++    use std::io::Cursor;
++    use std::sync::Mutex;
++    use thinp::cache::mapping::Mapping;
++    use thinp::cache::superblock::*;
++    use thinp::checksum::{write_checksum, BT};
++    use thinp::io_engine::{Block, IoEngine};
++    use thinp::pdata::array::{self, pack_array_block, ArrayBlock};
++    use thinp::pdata::array_walker::{ArrayVisitor, ArrayWalker};
++    use thinp::pdata::bitset::read_bitset_checked;
++
++    struct Collector {
++        blocks: Mutex<Vec<(u64, ArrayBlock<Mapping>)>>,
++    }
++
++    impl ArrayVisitor<Mapping> for Collector {
++        fn visit(&self, index: u64, b: ArrayBlock<Mapping>) -> array::Result<()> {
++            self.blocks.lock().unwrap().push((index, b));
++            Ok(())
++        }
++    }
++
++    let engine = SyncIoEngine::new(md, true)?;
++    let sb = read_superblock(&engine, SUPERBLOCK_LOCATION)?;
++    let dirty_root = sb
++        .dirty_root
++        .ok_or_else(|| anyhow::anyhow!("no dirty bitset"))?;
++    let (dirty_bits, err) =
++        read_bitset_checked(&engine, dirty_root, sb.cache_blocks as usize, false);
++    if let Some(e) = err {
++        return Err(anyhow::anyhow!("failed to read dirty bitset: {}", e));
++    }
++
++    let collector = Collector {
++        blocks: Mutex::new(Vec::new()),
++    };
++    ArrayWalker::new(&engine, false).walk(&collector, sb.mapping_root)?;
++
++    let mut count = 0;
++    for (index, mut ablock) in collector.blocks.into_inner().unwrap() {
++        let cbegin = index * ablock.header.max_entries as u64;
++        let mut modified = false;
++        for (i, m) in ablock.values.iter_mut().enumerate() {
++            if count == nr {
++                break;
++            }
++            let cblock = (cbegin + i as u64) as usize;
++            if m.is_valid() && dirty_bits.contains(cblock) == Some(true) {
++                *m = Mapping {
++                    oblock: 0,
++                    flags: 0,
++                };
++                count += 1;
++                modified = true;
++            }
++        }
++        if modified {
++            let b = Block::zeroed(ablock.header.blocknr);
++            pack_array_block(&ablock, &mut Cursor::new(b.get_data()))?;
++            write_checksum(b.get_data(), BT::ARRAY)?;
++            engine.write(&b)?;
++        }
++    }
++
++    Ok(count)
++}
++
++//-----------------------------------------------
